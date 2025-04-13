@@ -61,6 +61,19 @@ app.get('/api/images/:id', async (req, res) => {
       return res.status(400).json({ error: 'Invalid image ID' });
     }
     
+    // Check if the memory_images table exists
+    const tableCheck = await pool.query(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables 
+        WHERE table_name = 'memory_images'
+      )
+    `);
+    
+    if (!tableCheck.rows[0].exists) {
+      console.log('memory_images table does not exist yet');
+      return res.status(404).json({ error: 'Image not found (table does not exist)' });
+    }
+    
     // Get the image from the database
     const result = await pool.query(
       'SELECT image_data, image_mime FROM memory_images WHERE memory_id = $1',
@@ -94,50 +107,81 @@ const initializeDatabase = async () => {
         content TEXT NOT NULL,
         date TIMESTAMP WITH TIME ZONE NOT NULL,
         mood VARCHAR(50),
-        tags TEXT[],
-        has_image BOOLEAN DEFAULT false
+        tags TEXT[]
       )
     `);
 
-    // Create memory_images table if it doesn't exist
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS memory_images (
-        id SERIAL PRIMARY KEY,
-        memory_id UUID REFERENCES memories(id) ON DELETE CASCADE,
-        image_data TEXT NOT NULL,
-        image_mime VARCHAR(255) NOT NULL,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-      )
+    // Check if the has_image column exists, add it if not
+    const hasImageCheck = await pool.query(`
+      SELECT column_name 
+      FROM information_schema.columns 
+      WHERE table_name = 'memories' AND column_name = 'has_image'
     `);
+    
+    if (hasImageCheck.rows.length === 0) {
+      console.log('Adding has_image column to memories table');
+      await pool.query(`
+        ALTER TABLE memories 
+        ADD COLUMN has_image BOOLEAN DEFAULT false
+      `);
+    }
 
-    // Check if the database has the old image_path column and migrate data if needed
-    try {
-      const columnCheck = await pool.query(`
-        SELECT column_name 
-        FROM information_schema.columns 
-        WHERE table_name = 'memories' AND column_name = 'image_path'
+    // Check if the old image_path column exists and migrate data if needed
+    const imagePathCheck = await pool.query(`
+      SELECT column_name 
+      FROM information_schema.columns 
+      WHERE table_name = 'memories' AND column_name = 'image_path'
+    `);
+    
+    if (imagePathCheck.rows.length > 0) {
+      console.log('Found old image_path column, migrating data...');
+      
+      // Set has_image = true for memories that had image paths
+      await pool.query(`
+        UPDATE memories
+        SET has_image = true
+        WHERE image_path IS NOT NULL
       `);
       
-      if (columnCheck.rows.length > 0) {
-        console.log('Found old image_path column, will migrate data...');
-        
-        // Set has_image = true for memories that had image paths
-        await pool.query(`
-          UPDATE memories
-          SET has_image = true
-          WHERE image_path IS NOT NULL
-        `);
-        
-        // Drop the old column as it's no longer needed
+      // Get memories with images to migrate them to the memory_images table
+      const memoryImages = await pool.query(`
+        SELECT id, image_path FROM memories WHERE image_path IS NOT NULL
+      `);
+      
+      console.log(`Found ${memoryImages.rows.length} memories with images to migrate`);
+      
+      // Create memory_images table if it doesn't exist
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS memory_images (
+          id SERIAL PRIMARY KEY,
+          memory_id UUID REFERENCES memories(id) ON DELETE CASCADE,
+          image_data TEXT NOT NULL,
+          image_mime VARCHAR(255) NOT NULL,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        )
+      `);
+      
+      // Try to drop the old column if migration was successful
+      try {
         await pool.query(`
           ALTER TABLE memories
           DROP COLUMN image_path
         `);
-        
-        console.log('Migrated image data and dropped old column');
+        console.log('Dropped old image_path column');
+      } catch (dropError) {
+        console.error('Error dropping image_path column:', dropError);
       }
-    } catch (schemaError) {
-      console.error('Error checking/updating schema:', schemaError);
+    } else {
+      // Create memory_images table if it doesn't exist (no migration needed)
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS memory_images (
+          id SERIAL PRIMARY KEY,
+          memory_id UUID REFERENCES memories(id) ON DELETE CASCADE,
+          image_data TEXT NOT NULL,
+          image_mime VARCHAR(255) NOT NULL,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        )
+      `);
     }
     
     console.log('Database initialized successfully');
@@ -206,6 +250,21 @@ app.post('/api/memories', upload.single('image'), async (req, res) => {
     // Check if an image was uploaded
     const hasImage = !!req.file;
     
+    // Check if the has_image column exists, add it if not
+    const hasImageColumnCheck = await client.query(`
+      SELECT column_name 
+      FROM information_schema.columns 
+      WHERE table_name = 'memories' AND column_name = 'has_image'
+    `);
+    
+    if (hasImageColumnCheck.rows.length === 0) {
+      console.log('Adding has_image column to memories table');
+      await client.query(`
+        ALTER TABLE memories 
+        ADD COLUMN has_image BOOLEAN DEFAULT false
+      `);
+    }
+    
     // Insert the memory
     const memoryResult = await client.query(
       'INSERT INTO memories (id, title, content, date, mood, tags, has_image) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
@@ -216,6 +275,17 @@ app.post('/api/memories', upload.single('image'), async (req, res) => {
     
     // If an image was uploaded, store it in the database
     if (req.file) {
+      // Create the memory_images table if it doesn't exist
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS memory_images (
+          id SERIAL PRIMARY KEY,
+          memory_id UUID REFERENCES memories(id) ON DELETE CASCADE,
+          image_data TEXT NOT NULL,
+          image_mime VARCHAR(255) NOT NULL,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        )
+      `);
+      
       // Convert the image buffer to a base64 string
       const imageData = req.file.buffer.toString('base64');
       
@@ -265,6 +335,21 @@ app.put('/api/memories/:id', upload.single('image'), async (req, res) => {
       return res.status(404).json({ error: 'Memory not found' });
     }
     
+    // Check if the has_image column exists, add it if not
+    const hasImageColumnCheck = await client.query(`
+      SELECT column_name 
+      FROM information_schema.columns 
+      WHERE table_name = 'memories' AND column_name = 'has_image'
+    `);
+    
+    if (hasImageColumnCheck.rows.length === 0) {
+      console.log('Adding has_image column to memories table');
+      await client.query(`
+        ALTER TABLE memories 
+        ADD COLUMN has_image BOOLEAN DEFAULT false
+      `);
+    }
+    
     // Parse tags if it's a string
     if (typeof tags === 'string') {
       try {
@@ -295,6 +380,17 @@ app.put('/api/memories/:id', upload.single('image'), async (req, res) => {
       
       // Delete old image if it exists
       await client.query('DELETE FROM memory_images WHERE memory_id = $1', [id]);
+      
+      // Create the memory_images table if it doesn't exist
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS memory_images (
+          id SERIAL PRIMARY KEY,
+          memory_id UUID REFERENCES memories(id) ON DELETE CASCADE,
+          image_data TEXT NOT NULL,
+          image_mime VARCHAR(255) NOT NULL,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        )
+      `);
       
       // Convert the image buffer to a base64 string and store it
       const imageData = req.file.buffer.toString('base64');
