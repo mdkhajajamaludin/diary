@@ -24,4 +24,7 @@ coverage
 
 # System files
 .DS_Store
-Thumbs.db 
+Thumbs.db
+
+# Uploads folder - don't track uploaded images
+uploads/ 
